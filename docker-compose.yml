@@ -1,0 +1,23 @@
+x-nginx: &nginx
+  image: nginx:1.27-alpine
+  volumes:
+    - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    - ./nginx/conf.d:/etc/nginx/conf.d:ro
+  depends_on: [app1, app2]
+
+services:
+  app1:
+    image: nginx:1.27-alpine
+    hostname: app1
+    volumes: ["./app/default.conf:/etc/nginx/conf.d/default.conf:ro"]
+  app2:
+    image: nginx:1.27-alpine
+    hostname: app2
+    volumes: ["./app/default.conf:/etc/nginx/conf.d/default.conf:ro"]
+  nginx1: *nginx
+  nginx2: *nginx
+  haproxy:
+    image: haproxy:3.0-alpine
+    volumes: ["./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
+    ports: ["8080:80", "8404:8404"]
+    depends_on: [nginx1, nginx2]
