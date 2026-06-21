@@ -13,7 +13,7 @@ command -v "$NGINX_BIN" >/dev/null || { echo "nginx not found" >&2; exit 2; }
 command -v "$HAPROXY_BIN" >/dev/null || { echo "haproxy not found" >&2; exit 2; }
 
 TMP="$(mktemp -d)"
-LB=9080 STATS=9404 N1=9101 N2=9102 A1=9001 A2=9002
+LB=9080 TLS=9443 STATS=9404 N1=9101 N2=9102 A1=9001 A2=9002
 cleanup() {
   for pf in "$TMP"/*/nginx.pid "$TMP"/haproxy.pid; do
     [[ -f "$pf" ]] && kill "$(cat "$pf")" 2>/dev/null || true
@@ -47,7 +47,9 @@ start_proxy() {  # name port
 }
 
 start_haproxy() {
+  "$ROOT/scripts/gen-cert.sh" "$TMP/certs" >/dev/null
   sed -e "s/bind \*:80/bind 127.0.0.1:$LB/" -e "s/bind \*:8404/bind 127.0.0.1:$STATS/" \
+      -e "s#bind \*:443 ssl crt [^ ]*#bind 127.0.0.1:$TLS ssl crt $TMP/certs/lab.pem#" \
       -e "s/nginx1:80/127.0.0.1:$N1/" -e "s/nginx2:80/127.0.0.1:$N2/" \
       -e "s/log stdout format raw local0/log stdout format raw local0/" haproxy/haproxy.cfg >"$TMP/haproxy.cfg"
   "$HAPROXY_BIN" -c -f "$TMP/haproxy.cfg" >/dev/null
@@ -66,22 +68,31 @@ start_app app1 $A1; start_app app2 $A2
 start_proxy nginx1 $N1; start_proxy nginx2 $N2
 start_haproxy
 wait_for "http://127.0.0.1:$LB/healthz"
+S="https://127.0.0.1:$TLS"   # all functional tests go through TLS (-k: self-signed)
 
 # 1. Health endpoint
-[[ "$(curl -fsS "http://127.0.0.1:$LB/healthz")" == "ok" ]] && pass "health endpoint" || fail "health"
+[[ "$(curl -fsS "http://127.0.0.1:$LB/healthz")" == "ok" ]] && pass "health endpoint (plain HTTP allowed)" || fail "health"
+
+# 1b. HTTP is redirected to HTTPS; HTTPS works; TLS 1.1 is refused
+code="$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "http://127.0.0.1:$LB/")"
+[[ "$code" == 301\ https://* ]] && pass "HTTP redirects to HTTPS ($code)" || fail "no redirect: $code"
+curl -fsSk "$S/" >/dev/null && pass "HTTPS request served" || fail "HTTPS failed"
+curl -sk --tls-max 1.1 --tlsv1.1 -o /dev/null "$S/" 2>/dev/null && fail "TLS 1.1 was accepted" || pass "TLS 1.1 refused"
+[[ "$(curl -fsSkI "$S/" | tr -d '\r' | grep -ci '^strict-transport-security')" == 1 ]] && pass "HSTS header set" || fail "no HSTS"
+curl -fsSkI "$S/" | tr -d '\r' | grep -qi '^X-Seen-Proto: https' && pass "backend sees X-Forwarded-Proto: https" || fail "scheme not propagated"
 
 # 2. Load balancing reaches both app replicas
-seen="$(for _ in $(seq 1 20); do curl -fsS "http://127.0.0.1:$LB/"; done | sort -u | tr -d '\n')"
+seen="$(for _ in $(seq 1 20); do curl -fsSk "$S/"; done | sort -u | tr -d '\n')"
 [[ "$seen" == *app1* && "$seen" == *app2* ]] && pass "requests reach both app replicas" || fail "no balancing, saw: $seen"
 
 # 3. Security headers added by NGINX
-hdrs="$(curl -fsSI "http://127.0.0.1:$LB/")"
+hdrs="$(curl -fsSkI "$S/")"
 grep -qi '^X-Content-Type-Options: nosniff' <<<"$hdrs" && pass "security headers present" || fail "missing headers"
 
 # 4. Failover: stop nginx1, HAProxy must eject it and keep serving
 kill "$(cat "$TMP/nginx1/nginx.pid")"
 sleep 11   # inter 3s * fall 3 = 9s to eject
-for _ in $(seq 1 10); do curl -fsS -o /dev/null "http://127.0.0.1:$LB/" || fail "request failed during failover"; done
+for _ in $(seq 1 10); do curl -fsSk -o /dev/null "$S/" || fail "request failed during failover"; done
 pass "traffic survives losing one proxy"
 curl -fsS "http://127.0.0.1:$STATS/stats;csv" | grep -E '^nginx_pool,nginx1,' | grep -q ',DOWN,' && pass "HAProxy marked nginx1 DOWN" || fail "nginx1 not marked down"
 
