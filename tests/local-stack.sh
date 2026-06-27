@@ -96,4 +96,13 @@ for _ in $(seq 1 10); do curl -fsSk -o /dev/null "$S/" || fail "request failed d
 pass "traffic survives losing one proxy"
 curl -fsS "http://127.0.0.1:$STATS/stats;csv" | grep -E '^nginx_pool,nginx1,' | grep -q ',DOWN,' && pass "HAProxy marked nginx1 DOWN" || fail "nginx1 not marked down"
 
+# 5. Rate limiting: a burst from one client gets 429 from HAProxy (limit 100 req / 10s)
+curl -fsSk -o /dev/null "$S/" || true
+limited=0
+for _ in $(seq 1 160); do
+  if curl -sk -D - -o /dev/null "$S/" | tr -d '\r' | grep -qi '^X-Limited-By: haproxy'; then limited=$((limited+1)); fi
+done
+(( limited > 0 )) && pass "rate limit kicked in ($limited of 160 burst requests got 429)" || fail "no request was rate limited"
+curl -sk -o /dev/null -w '%{http_code}' "http://127.0.0.1:$LB/healthz" | grep -q 200 && pass "health probes exempt from rate limit" || fail "healthz was limited"
+
 echo "all local-stack tests passed"
