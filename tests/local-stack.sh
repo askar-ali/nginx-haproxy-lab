@@ -41,8 +41,9 @@ start_proxy() {  # name port
   sed -e "s/app1:80/127.0.0.1:$A1/" -e "s/app2:80/127.0.0.1:$A2/" \
       -e "s#include /etc/nginx/conf.d/\*.conf;#include $d/conf.d/*.conf;#" \
       -e "1i pid $d/nginx.pid;\nerror_log $d/error.log;" \
-      -e "s#^http {#http {\n  access_log $d/access.log; $(temp_paths "$d")#" nginx/nginx.conf >"$d/nginx.conf"
-  sed -e "s/listen 80;/listen 127.0.0.1:$2;/" nginx/conf.d/proxy.conf >"$d/conf.d/proxy.conf"
+      -e "s#/var/log/nginx/access.log#$d/access.log#" \
+      -e "s#^http {#http {\n  $(temp_paths "$d")#" nginx/nginx.conf >"$d/nginx.conf"
+  sed -e "s/listen 80;/listen 127.0.0.1:$2;/" -e "s/listen 8081;/listen 127.0.0.1:$(( $2 + 100 ));/" nginx/conf.d/proxy.conf >"$d/conf.d/proxy.conf"
   "$NGINX_BIN" -p "$d" -c "$d/nginx.conf"
 }
 
@@ -88,6 +89,14 @@ seen="$(for _ in $(seq 1 20); do curl -fsSk "$S/"; done | sort -u | tr -d '\n')"
 # 3. Security headers added by NGINX
 hdrs="$(curl -fsSkI "$S/")"
 grep -qi '^X-Content-Type-Options: nosniff' <<<"$hdrs" && pass "security headers present" || fail "missing headers"
+
+# 3b. Structured JSON access log and the internal status endpoint
+curl -fsSk -o /dev/null "$S/" && sleep 0.3
+logfile="$(ls -t "$TMP"/nginx*/access.log | head -1)"
+tail -1 "$logfile" | jq -e '.status == 200 and (.upstream | length > 0) and (.request_time >= 0)' >/dev/null \
+  && pass "NGINX access log is valid JSON with upstream fields" || fail "bad JSON log line: $(tail -1 "$logfile")"
+curl -fsS "http://127.0.0.1:$(( N1 + 100 ))/stub_status" | grep -q '^Active connections' \
+  && pass "stub_status reachable on the internal port" || fail "stub_status unreachable"
 
 # 4. Failover: stop nginx1, HAProxy must eject it and keep serving
 kill "$(cat "$TMP/nginx1/nginx.pid")"
