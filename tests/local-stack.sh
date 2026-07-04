@@ -49,7 +49,9 @@ start_proxy() {  # name port
 
 start_haproxy() {
   "$ROOT/scripts/gen-cert.sh" "$TMP/certs" >/dev/null
+  export HAPROXY_SOCK="$TMP/admin.sock"
   sed -e "s/bind \*:80/bind 127.0.0.1:$LB/" -e "s/bind \*:8404/bind 127.0.0.1:$STATS/" \
+      -e "s#stats socket [^ ]*#stats socket $TMP/admin.sock#" \
       -e "s#bind \*:443 ssl crt [^ ]*#bind 127.0.0.1:$TLS ssl crt $TMP/certs/lab.pem#" \
       -e "s/nginx1:80/127.0.0.1:$N1/" -e "s/nginx2:80/127.0.0.1:$N2/" \
       -e "s/log stdout format raw local0/log stdout format raw local0/" haproxy/haproxy.cfg >"$TMP/haproxy.cfg"
@@ -97,6 +99,18 @@ tail -1 "$logfile" | jq -e '.status == 200 and (.upstream | length > 0) and (.re
   && pass "NGINX access log is valid JSON with upstream fields" || fail "bad JSON log line: $(tail -1 "$logfile")"
 curl -fsS "http://127.0.0.1:$(( N1 + 100 ))/stub_status" | grep -q '^Active connections' \
   && pass "stub_status reachable on the internal port" || fail "stub_status unreachable"
+
+# 3c. Runtime control: drain a server, see it, restore it
+"$ROOT/scripts/lb-server.sh" drain nginx2 >/dev/null
+state="$(curl -fsS "http://127.0.0.1:$STATS/stats;csv" | awk -F, '$1=="nginx_pool" && $2=="nginx2" {print $18}')"
+[[ "$state" == DRAIN* ]] && pass "drain puts nginx2 in DRAIN ($state)" || fail "drain not applied: '$state'"
+for _ in $(seq 1 10); do curl -fsSk -o /dev/null "$S/" || fail "request failed while draining"; done
+"$ROOT/scripts/lb-server.sh" ready nginx2 >/dev/null
+state="$(curl -fsS "http://127.0.0.1:$STATS/stats;csv" | awk -F, '$1=="nginx_pool" && $2=="nginx2" {print $18}')"
+[[ "$state" == UP* ]] && pass "ready returns nginx2 to rotation ($state)" || fail "ready not applied: '$state'"
+
+# 3d. Prometheus metrics endpoint
+curl -fsS "http://127.0.0.1:$STATS/metrics" | grep -q '^haproxy_backend_status{proxy="nginx_pool"' && pass "Prometheus metrics exposed" || fail "no /metrics"
 
 # 4. Failover: stop nginx1, HAProxy must eject it and keep serving
 kill "$(cat "$TMP/nginx1/nginx.pid")"
