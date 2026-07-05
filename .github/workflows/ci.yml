@@ -1,0 +1,14 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nginx, haproxy and tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nginx haproxy curl jq openssl shellcheck
+          sudo systemctl stop nginx haproxy || true
+      - run: shellcheck scripts/*.sh tests/*.sh
+      - run: make test-local
